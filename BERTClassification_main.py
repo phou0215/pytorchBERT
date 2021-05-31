@@ -5,8 +5,10 @@ import sys
 import os
 import torch
 import re
+import time
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 
 from konlpy.tag import Okt
 from konlpy.tag import Komoran
@@ -19,8 +21,10 @@ from sklearn.metrics import f1_score
 
 # from tqdm.notebook import tqdm
 from torch.utils.data import DataLoader, Dataset, TensorDataset, RandomSampler, SequentialSampler
-from transformers import BertTokenizer, BertForSequenceClassification, BertConfig
-from transformers import AdamW, get_linear_schedule_with_warmup
+from transformers import BertTokenizer, BertForSequenceClassification, BertConfig, BertTokenizerFast
+from tokenizers import BertWordPieceTokenizer, SentencePieceBPETokenizer, CharBPETokenizer, ByteLevelBPETokenizer
+from transformers import AdamW, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup, \
+    get_cosine_with_hard_restarts_schedule_with_warmup
 # from torch.optim import optimizer, Adam
 from torch.nn import functional as F
 
@@ -38,28 +42,45 @@ class PytorchBERT():
         self.list_label = None
         self.list_special = None
         self.list_rmstring = None
+        self.list_corpus = None
 
         # split train and test data
         self.Train_Data_X = None
         self.Train_Data_Y = None
         self.Test_Data_X = None
         self.Test_Data_Y = None
-        self.model_root_dir = './save_models'
-        self.model_dir = ''
-        self.model = None
         self.df_data = None
         self.label_index = None
 
+        # type '' => base no customer tokenizer, type 'word' => word piece, type 'sentence' => sentence piece
+        self.tokenizer_type = 'word'
+        # if tokenizer_type is not default select konlpy parse type 'okt' or default is Okt , 'komoran' is Komoran
+        self.subword_type = 'okt'
+        # public tokenizer
+        self.konlpy_parser = None
+
+        # file_path
+        self.model_root_dir = './save_models'
+        self.vocab_root_dir = './save_vocab'
+        self.file_path = './voc_data.xlsx'
+        self.corpus_path = './' + self.subword_type + '_text.txt'
+        self.corpus_raw_data_path = "./corpus.csv"
+        self.model_dir = ''
+        self.vocab_dir = ''
+
+        # pyplot
+        self.figure = None
+        self.line_loss = None
+        self.line_score = None
+
+        # Options and utility
+        self.model = None
         self.test_rate = 0.2
         self.batch_size = 2
         self.epoch = 5
         self.learning_rate = 1e-5
-        self.file_path = './voc_data.xlsx'
         self.device = torch.device('cpu')
-        self.pattern = re.compile("[1-9]{1}[.]{1}")
-
-        self.komoran = Komoran()
-        self.twitter = Okt()
+        self.pattern = re.compile("([1-9]{1,2}\.)")
 
         self.stopString = ["안내", "여부", "사항", "장비", "확인", "원클릭", "품질", "후", "문의", "이력", "진단", "부탁드립니다.",
                            "증상", "종료", "문의", "양호", "정상", "고객", "철회", "파이", "특이", "간다", "내부", "외부", "권유",
@@ -101,6 +122,50 @@ class PytorchBERT():
             label_dict[label] = index
         return label_dict
 
+    # unless exists saved model directory, generate model's directory
+    def generate_model_directory(self):
+
+        # root dir ath check and generate
+        if not os.path.isdir(self.model_root_dir):
+            os.makedirs(self.model_root_dir, exist_ok=True)
+
+        # generate models directory
+        self.model_dir = '/BERT_TRAINING_MODEL_' + self.getCurrent_time()[2] + '/'
+        os.makedirs(self.model_root_dir + self.model_dir, exist_ok=True)
+
+    # ###################### matplot graph 지원함수 #######################
+
+    def generate_graph(self):
+
+        x = np.linspace(1, self.epoch, self.epoch)
+        self.figure, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 8))
+        ax1.set_title('LOSS')
+        ax1.set(xlabel='Epoch', ylabel='avg_loss')
+        self.line_loss, = ax1.plot(x, np.array([0.000] * self.epoch), 'tab:blue')
+
+        ax2.set_title('F1 SCORE')
+        ax2.set(xlabel='Epoch', ylabel='F1 Score')
+        self.line_score, = ax2.plot(x, np.array([0.000] * self.epoch), 'tab:green')
+
+    def init_graph(self):
+
+        self.figure.canvas.draw()
+        # self.figure.canvas.flush_events()
+
+    def grid_loss_graph(self, y):
+        x_data = np.linspace(1, self.epoch, self.epoch)
+        self.line_loss.set_xdata(x_data)
+        self.line_loss.set_ydata(y)
+
+    def grid_f1_graph(self, y):
+        x_data = np.linspace(1, self.epoch, self.epoch)
+        self.line_score.set_xdata(x_data)
+        self.line_score.set_ydata(y)
+
+    # ####################################################################
+
+    # ####################### 텍스트 전처리 지원함수 #########################
+
     # 특정 문자 구간 Parsing 함수(앞에서부터)
     def find_between(self, s, first, last):
 
@@ -121,62 +186,205 @@ class PytorchBERT():
         except ValueError:
             return ""
 
-    def generate_model_directory(self):
-
-        # root dir ath check and generate
-        if not os.path.isdir(self.model_root_dir):
-            os.makedirs(self.model_root_dir, exist_ok=True)
-
-        # generate models directory
-        self.model_dir = '/BERT_TRAINING_MODEL_'+self.getCurrent_time()[2]+'/'
-        os.makedirs(self.model_root_dir + self.model_dir, exist_ok=True)
-
-    # 특수문자 제거 함수
+    # remove special char and confusing words united only one expression
     def remove_special(self, text):
 
+        # 영문 모두 소문자로 변경
+        text_data = text.lower()
         # 전화번호 모두 'tel로 치환'
-        text_data = re.sub(r'\d{2,3}[-\.\s]*\d{3,4}[-\.\s]*\d{4}(?!\d)', 'tel', text)
+        text_data = re.sub(r'\d{2,3}[-\.\s]*\d{3,4}[-\.\s]*\d{4}(?!\d)', 'tel', text_data)
         # 화폐는 'money'로 치환
         text_data = re.sub(r'\d{1,3}[,\.]\d{1,3}[만\천]?\s?[원]|\d{1,5}[만\천]?\s?[원]', 'money', text_data)
         text_data = re.sub(r'일/이/삼/사/오/육/칠/팔/구/십/백][만\천]\s?[원]', 'money', text_data)
         text_data = re.sub(r'(?!-)\d{2,4}[0]{2,4}(?!년)(?!.)|\d{1,3}[,/.]\d{3}', 'money', text_data)
+        text_data = re.sub(r'[1-9]g', ' cellular ', text_data)
+        text_data = re.sub(r'(유심|usim|sim|esim)', 'usim', text_data)
+        text_data = re.sub(r'(sms|mms|메시지)', 'message', text_data)
+        text_data = re.sub(r'통신.?내역', 'list', text_data)
         # web 주소는 'url'로 변경
-        text_data = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),|]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
-                           'url', text_data)
+        text_data = re.sub(
+            r'(https?:\/\/(?:www\.|(?!www))[a-zA-Z0-9][a-zA-Z0-9-]+[a-zA-Z0-9]\.[^\s]{2,}|www\.[a-zA-Z0-9][a-zA-Z0-9-]+[a-zA-Z0-9]\.[^\s]{2,}|https?:\/\/(?:www\.|(?!www))[a-zA-Z0-9]+\.[^\s]{2,}|www\.[a-zA-Z0-9]+\.[^\s]{2,})',
+            'url',
+            text_data)
         # 그 외의 특수문자는 모두 삭제
-        text_data = re.sub(r'[-=+,_#/\?^$@*\"※~&%ㆍ!』\‘|\(\)\[\]\<\>\{\}`><\']', '', text_data)
-        # 영문 모두 소문자로 변경
-        text_data = text_data.lower()
+        text_data = re.sub(r'[-=+,_#/\?^$@*\"※~&%ㆍ!』\‘|\(\)\[\]\<\>\{\}`><\':;■◈▶●★☎]', ' ', text_data)
         # 앞서 list_rmstring 선언된 단어들 모두 제거
         for item in self.list_rmstring:
             text_data = text_data.replace(item, "")
+        # 필수 제거 단어 제거
+        for item in self.stopString:
+            text_data = text_data.replace(item, "")
 
+        # 앞 뒤 공백 제거
         text_data = text_data.strip()
         return text_data
 
-    #  특수한 형태의 문장을 필요 데이터만 추출 후 버림
-    def text_filter(self, list_doc):
+    # konlpy text parsing 실행 함수
+    def subword_text(self, text):
+        try:
+            mal_ist = self.konlpy_parser.morphs(text)
+            return mal_ist
+        except:
+            self.setPrint('Error: {}. {}, line: {}'.format(sys.exc_info()[0],
+                                                           sys.exc_info()[1],
+                                                           sys.exc_info()[2].tb_lineno))
+            return None
 
-        list_return = list_doc
-        for idx, doc in enumerate(list_return):
-            for item in self.list_special:
-                if item in doc:
-                    spec_string = item
-                    doc = doc + "/e"
-                    text = self.find_between(doc, spec_string, "/e")
-                    if self.pattern.search(text):
-                        pattern_list = self.pattern.findall(text)
-                        doc = self.find_between(doc, spec_string, pattern_list[0])
-                    else:
-                        doc = doc.replace("/e", "")
-                    break
-            doc = self.remove_special(doc)
-            doc = "\n".join([s for s in doc.split('\n') if s])
-            list_return[idx] = doc
+    # konlpy 형태소 분류 형태 텍스트 전처리
+    def text_konlpy_filter(self, list_doc, list_label):
 
-        return list_return
+        try:
+            list_return_docs = []
+            list_return_labels = []
+            for idx, doc in enumerate(list_doc):
+                for item in self.list_special:
+                    if item in doc:
+                        spec_string = item
+                        doc = doc + "/e"
+                        text = self.find_between(doc, spec_string, "/e")
+                        if self.pattern.search(text):
+                            pattern_list = self.pattern.findall(text)
+                            doc = self.find_between(doc, spec_string, pattern_list[0])
+                        else:
+                            doc = doc.replace("/e", "")
+                        break
+                doc = self.remove_special(doc)
+                if doc == "":
+                    continue
+                split_doc = self.subword_text(doc)
+                doc = " ".join([s.strip() for s in split_doc if s])
+                list_return_docs.append(doc)
+                if list_label:
+                    list_return_labels.append(list_label[idx])
+            return list_return_docs, list_return_labels
+        except:
+            self.setPrint('Error: {}. {}, line: {}'.format(sys.exc_info()[0],
+                                                           sys.exc_info()[1],
+                                                           sys.exc_info()[2].tb_lineno))
+            return None
 
-    # Read excel file and generate dataframe, list.
+    # 특수문자 혹은 치환만 하는 텍스트 전처리
+    def text_normal_filter(self, list_doc, list_label):
+
+        try:
+            list_return_docs = []
+            list_return_labels = []
+            for idx, doc in enumerate(list_doc):
+                for item in self.list_special:
+                    if item in doc:
+                        spec_string = item
+                        doc = doc + "/e"
+                        text = self.find_between(doc, spec_string, "/e")
+                        if self.pattern.search(text):
+                            pattern_list = self.pattern.findall(text)
+                            doc = self.find_between(doc, spec_string, pattern_list[0])
+                        else:
+                            doc = doc.replace("/e", "")
+                        break
+                doc = self.remove_special(doc)
+                if doc == "":
+                    continue
+                list_return_docs.append(doc)
+                if list_label:
+                    list_return_labels.append(list_label[idx])
+
+            return list_return_docs, list_return_labels
+        except:
+            self.setPrint('Error: {}. {}, line: {}'.format(sys.exc_info()[0],
+                                                           sys.exc_info()[1],
+                                                           sys.exc_info()[2].tb_lineno))
+            return None
+
+    # ####################################################################
+
+    # ####################### Tokenizer 생성 및 데이터 생성 지원함수 #########################
+
+    def generate_corpus_file(self, list_text):
+
+        try:
+            with open(self.corpus_path, 'w', encoding='utf-8') as f:
+                for line in list_text:
+                    f.write(line+'\n')
+            self.setPrint('Corpus File is created')
+        except:
+            self.setPrint('Error: {}. {}, line: {}'.format(sys.exc_info()[0],
+                                                           sys.exc_info()[1],
+                                                           sys.exc_info()[2].tb_lineno))
+
+    # generate tokenizer
+    def generate_custom_vocab(self):
+
+        try:
+            tokenizer = None
+            # root dir path check and generate
+            if not os.path.isdir(self.vocab_root_dir):
+                os.makedirs(self.vocab_root_dir, exist_ok=True)
+
+            # generate models directory
+            self.vocab_dir = '/BERT_TRAINING_VOCAB_' + self.getCurrent_time()[2] + '/'
+            os.makedirs(self.vocab_root_dir + self.vocab_dir, exist_ok=True)
+
+            user_defined_symbols = ['[BOS]', '[EOS]', '[UNK]', '[UNK1]', '[UNK2]', '[UNK3]', '[UNK4]', '[UNK5]',
+                                    '[UNK6]', '[UNK7]', '[UNK8]', '[UNK9]']
+            unused_token_num = 200
+            unused_list = ['[unused{}]'.format(n) for n in range(unused_token_num)]
+            user_defined_symbols = user_defined_symbols + unused_list
+
+            if self.tokenizer_type == 'word':
+                # if lowercase is False must set strip_accents option as 'False'
+                tokenizer = BertWordPieceTokenizer(strip_accents=False,
+                                                   lowercase=True,
+                                                   clean_text=True,
+                                                   handle_chinese_chars=True,
+                                                   wordpieces_prefix="##"
+                                                   )
+            else:
+                tokenizer = SentencePieceBPETokenizer()
+            # when selected 'base' going to use bert-base-uncased tokenizer... close function
+
+            # training vocab start
+            corpus_file = [self.corpus_path]
+            vocab_size = 32000
+            limit_alphabet = 6000
+            min_frequency = 3
+            tokenizer.train(files=corpus_file,
+                            vocab_size=vocab_size,
+                            special_tokens=user_defined_symbols,
+                            min_frequency=min_frequency,  # 단어의 최소 발생 빈도, 3
+                            limit_alphabet=limit_alphabet,  # ByteLevelBPETokenizer 학습시엔 주석처리 필요
+                            show_progress=True)
+
+            self.setPrint('Customer Tokenizer Training is completed')
+
+            sentence = '전화 통화가 정상적으로 안됨.'
+            output = tokenizer.encode(sentence)
+            self.setPrint('Tokenizer 테스트 문장: {}'.format(sentence))
+            self.setPrint('Tokenizer 분석 결과\n=>idx: {}\n=>tokens: {}\n=>offset: {}\n=>decode: {}\n'.
+                          format(output.ids, output.tokens, output.offsets, tokenizer.decode(output.ids)))
+
+            # save tokenizer
+            tokenizer.save_model(self.vocab_root_dir + self.vocab_dir)
+
+            if self.tokenizer_type == 'sentence':
+
+                list_vocab = []
+                with open(self.vocab_root_dir + self.vocab_dir + '/merges.txt', 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                    for line in lines:
+                        if line.strip() != '':
+                            list_vocab.append(line)
+                print('출력내용 {}'.format(list_vocab[len(list_vocab) - 1]))
+                with open(self.vocab_root_dir + self.vocab_dir + '/merges.txt', 'w', encoding='utf-8') as f:
+                    for vocab in list_vocab:
+                        f.write(vocab)
+                self.setPrint('Rewrite merges text file completed')
+
+        except:
+            self.setPrint('Error: {}. {}, line: {}'.format(sys.exc_info()[0],
+                                                           sys.exc_info()[1],
+                                                           sys.exc_info()[2].tb_lineno))
+
+    # Read excel file and generate dataframe, list
     def generate_data(self):
 
         try:
@@ -184,6 +392,7 @@ class PytorchBERT():
             self.df_data = pd.read_excel(self.file_path, sheet_name="통품전체VOC", index_col=None)
             if self.df_data.shape:
                 self.setPrint('INPUT DATA SHAPE : {}'.format(self.df_data.shape))
+
             df_config1 = pd.read_excel(self.file_path, sheet_name="예약어리스트", index_col=None)
             df_config2 = pd.read_excel(self.file_path, sheet_name="Stop word", index_col=None)
 
@@ -197,25 +406,38 @@ class PytorchBERT():
             # 단어 제거 형식 선택
             self.list_rmstring = df_config2['일반형식'].tolist()
 
-            # 데이터 문자열 전처리
-            self.df_data['메모'] = self.df_data['메모'].apply(self.remove_special)
-            self.df_data['메모분류'] = self.df_data['메모분류'].apply(lambda x: x.strip())
+            if self.tokenizer_type != '':
 
-            # print 데이터 분포
+                if self.subword_type == 'okt':
+                    self.konlpy_parser = Okt()
+                else:
+                    self.konlpy_parser = Komoran()
+                # corpus data generate
+                df_vocab_data = pd.read_csv(self.corpus_raw_data_path, encoding='CP949')
+                self.list_corpus = df_vocab_data['메모'].tolist()
+                # corpus data cleaning data
+                self.list_corpus, list_labels = self.text_konlpy_filter(self.list_corpus, None)
+                self.generate_corpus_file(self.list_corpus)
+
+            # 메모분류 문자열 전처리
+            self.df_data['메모분류'] = self.df_data['메모분류'].apply(lambda x: x.strip())
+            # print 데이터 분포 확인
             self.setPrint('데이터 분포: \n{}'.format(self.df_data['메모분류'].value_counts()))
 
-            # label change to index format
+            # set the 'label' column  by '메모분류' index
             self.label_index = self.set_label_index(self.df_data, col_name='메모분류')
             self.df_data['label'] = self.df_data['메모분류'].replace(self.label_index)
-            self.setPrint('index of labels: \n{}'.format(self.label_index))
+            self.setPrint('Index Of Labels: \n{}'.format(self.label_index))
 
             # data frame index 번호 reset
             self.df_data.reset_index(drop=True)
-            df_config1.reset_index(drop=True)
-            df_config2.reset_index(drop=True)
-
-            self.list_memo = self.text_filter(self.df_data['메모'].tolist())
+            # get list_label
             self.list_label = self.df_data['label'].tolist()
+
+            if self.tokenizer_type != '':
+                self.list_memo, self.list_label = self.text_konlpy_filter(self.df_data['메모'].tolist(), self.list_label)
+            else:
+                self.list_memo, self.list_label = self.text_normal_filter(self.df_data['메모'].tolist(), self.list_label)
 
             self.Train_Data_X, self.Test_Data_X, \
             self.Train_Data_Y, self.Test_Data_Y = train_test_split(self.list_memo,
@@ -224,14 +446,18 @@ class PytorchBERT():
                                                                    random_state=42,
                                                                    shuffle=True,
                                                                    stratify=self.list_label)
-
-            self.setPrint('Train_Data: {:.2f}%, Test_Data: {:.2f}% '.
+            self.setPrint('Train_Data_Rate: {:.2f}%, Test_Data_Rate: {:.2f}% '.
                           format((1 - self.test_rate) * 100, self.test_rate * 100))
+            self.setPrint('Train_Data_Count: {}\nTest_Data_Count:{}\nCorpus_Data_Count:{}'.format(
+                len(self.Train_Data_Y), len(self.Test_Data_Y), len(self.list_corpus)))
         except:
             self.setPrint('Error: {}. {}, line: {}'.format(sys.exc_info()[0],
                                                            sys.exc_info()[1],
                                                            sys.exc_info()[2].tb_lineno))
 
+    # ####################################################################################
+
+    # ####################### matplot graph 지원함수 #########################
     def f1_score_func(self, preds, labels):
 
         preds_flat = np.argmax(preds, axis=1).flatten()
@@ -282,14 +508,54 @@ class PytorchBERT():
         true_vals = np.concatenate(true_vals, axis=0)
         return loss_val_avg, predictions, true_vals
 
+    # ######################################################################
+
+    # ####################### main 실행 함수 #########################
+
     def run(self):
+
+        torch.cuda.empty_cache()
 
         # raw data polling and pretreatment datas
         self.generate_data()
+
         # generate save model directory
         self.generate_model_directory()
 
-        tokenizer = BertTokenizer.from_pretrained("bert-base-multilingual-cased'", do_lower_case=True, local_files_only=True)
+        if self.tokenizer_type != '':
+            # generate corpus by Okt konlpy
+            # self.generate_custom_morphs(self.list_memo)
+
+            # generate tokenizer model
+            self.generate_custom_vocab()
+
+        tokenizer = None
+        if self.tokenizer_type == '':
+            # base tokenizer
+            tokenizer = BertTokenizer.from_pretrained("bert-base-uncased",
+                                                      lowercase=True,
+                                                      strip_accents=False,
+                                                      local_files_only=True)
+        elif self.tokenizer_type == 'word':
+            # word piece tokenizer
+            tokenizer = BertTokenizerFast.from_pretrained(self.vocab_root_dir + self.vocab_dir,
+                                                          strip_accents=False,
+                                                          lowercase=True)
+        else:
+            # sentence tokenizer
+            tokenizer = SentencePieceBPETokenizer(self.vocab_root_dir + self.vocab_dir + '/vocab.json',
+                                                  self.vocab_root_dir + self.vocab_dir + '/merges.txt', )
+
+        self.setPrint('Load Customer Vocab size : {}'.format(tokenizer.vocab_size))
+        # tokenizer Loading check
+        # tokenized_input_for_pytorch = tokenizer_for_load("i am very happy now", return_tensors="pt")
+        # encoded_text = tokenizer("전화 통화가 정상적으로 안됨", return_tensors="pt")
+        # self.setPrint("Tokens Text List: {}".format(
+        #     [tokenizer.convert_ids_to_tokens(s) for s in encoded_text['input_ids'].tolist()[0]]))
+        # self.setPrint("Tokens IDX  List: {}".format(encoded_text['input_ids'].tolist()[0]))
+        # self.setPrint("Tokens Mask List: {}".format(encoded_text['attention_mask'].tolist()[0]))
+
+        # transformed train data
         encoded_data_train = tokenizer.batch_encode_plus(
             self.Train_Data_X,
             add_special_tokens=True,
@@ -299,7 +565,7 @@ class PytorchBERT():
             return_tensors='pt',
             truncation=True
         )
-
+        # transformed validation data
         encoded_data_val = tokenizer.batch_encode_plus(
             self.Test_Data_X,
             add_special_tokens=True,
@@ -321,11 +587,12 @@ class PytorchBERT():
         dataset_train = TensorDataset(input_ids_train, attention_masks_train, labels_train)
         dataset_test = TensorDataset(input_ids_test, attention_masks_test, labels_test)
 
-        self.model = BertForSequenceClassification.from_pretrained("bert-base-multilingual-cased",
-                                                              num_labels=len(self.label_index),
-                                                              output_attentions=False,
-                                                              output_hidden_states=False,
-                                                              local_files_only=True).to(self.device)
+        # local_files_only = True
+        self.model = BertForSequenceClassification.from_pretrained("bert-base-uncased",
+                                                                   num_labels=len(self.label_index),
+                                                                   output_attentions=False,
+                                                                   output_hidden_states=False,
+                                                                   local_files_only=True).to(self.device)
 
         # dataLoader
         dataloader_train = DataLoader(dataset_train,
@@ -342,9 +609,16 @@ class PytorchBERT():
                                                     num_warmup_steps=0,
                                                     num_training_steps=len(dataloader_train) * self.epoch)
 
+        # scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(optimizer=optimizer,
+        #                                                                num_warmup_steps=0,
+        #                                                                num_training_steps=len(dataloader_train) * self.epoch)
+        # for loss f1 graph
+        total_loss = np.array([0.0000] * 5)
+        total_score = np.array([0.0000] * 5)
+
         # Training start
         for epoch in range(1, self.epoch + 1):
-
+            self.setPrint('Start of Epoch {}'.format(epoch))
             self.model.train()
             loss_train_total = 0
 
@@ -362,25 +636,75 @@ class PytorchBERT():
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
-                if idx % 100 == 0:
-                    self.setPrint('{}/{} training_loss : {:.4f}'.format(idx, len(dataloader_train),
-                                                                        loss.item() / len(batch)))
 
+                if idx % 100 == 0:
+                    self.setPrint('[{}]Epoch {}/{} training_loss : {:.4f}'.format(epoch, idx, len(dataloader_train),
+                                                                                  loss.item() / len(batch)))
+                # gpu memory reset
+                batch = None
+                torch.cuda.empty_cache()
+
+            # model save
             torch.save(self.model.state_dict(),
-                       self.model_root_dir + self.model_dir + 'finetuned_BERT_epoch_{}.model'.format(epoch))
-            self.setPrint('data_volume/finetuned_BERT_epoch_{}.model'.format(epoch))
-            self.setPrint('\nEpoch {}'.format(epoch))
+                       self.model_root_dir + self.model_dir + 'BERT_dict_epoch_{}.model'.format(epoch))
+            self.setPrint('Save fine_tuned_BERT_epoch_{}.model'.format(epoch))
+            self.setPrint('\nEnd of Epoch {}'.format(epoch))
 
             loss_train_avg = loss_train_total / len(dataloader_train)
-            self.setPrint('Training loss: {:.4f}'.format(loss_train_avg))
+            self.setPrint('[{}] Epoch Training loss: {:.4f}'.format(epoch, loss_train_avg))
+            total_loss[epoch - 1] = round(loss_train_avg, 4)
 
             val_loss, predictions, true_vals = self.evaluate(dataloader_test)
             val_f1 = self.f1_score_func(predictions, true_vals)
-            self.setPrint('Validation loss: {}'.format(val_loss))
-            self.setPrint('F1 Score : {}'.format(val_f1))
+            total_score[epoch - 1] = round(val_f1, 4)
+
+            self.setPrint('[{}] Validation loss: {:.4f}'.format(epoch, val_loss))
+            self.setPrint('[{}] F1 Score : {:.4f}'.format(epoch, val_f1))
+
+        # generate graph
+        plt.ion()
+        self.generate_graph()
+        self.grid_loss_graph(total_loss)
+        self.grid_f1_graph(total_score)
+        self.init_graph()
+
+    # ##############################################################
 
 
 if __name__ == "__main__":
     bert = PytorchBERT()
     bert.check_cuda()
     bert.run()
+
+    # def generate_custom_morphs(self, list_text):
+    #     # okt_tags = ['Noun', 'Adjective', 'Verb', 'Foreign', 'Alpha', 'Unknown', 'Determiner']
+    #     # komoran_tags = ['NNG', 'NNP', 'NNB', 'VV', 'MAG', 'VA', 'UN', 'MAJ', 'SL', 'NF', 'NA', 'NF']
+    #     try:
+    #         total_morphs = []
+    #         if self.subword_type == 'komoran':
+    #             parser = Komoran()
+    #             for line in list_text:
+    #                 if line.strip() == "":
+    #                     continue
+    #                 mal_list = parser.pos(line, stem=True, norm=True)
+    #                 morphs_sentence = [word for (word, tag) in mal_list if okt_tags in pos
+    #                                    and word not in self.stopString]
+    #                 total_morphs.append(morphs_sentence)
+    #         else:
+    #             parser = Komoran()
+    #             for line in list_text:
+    #                 if line.strip() == "":
+    #                     continue
+    #                 mal_list = parser.pos(line, stem=True, norm=True)
+    #                 morphs_sentence = [word for (word, tag) in mal_list if komoran_tags in pos
+    #                                    and word not in self.stopString]
+    #                 total_morphs.append(morphs_sentence)
+    #
+    #         with open(self.corpus_path, 'w', encoding='utf-8') as f:
+    #             for morphs in total_morphs:
+    #                 f.write(' '.join(morphs) + '\n')
+    #         self.setPrint('{} subword completed {}...'.format(self.subword_type, total_morphs[:10]))
+    #     except:
+    #         self.setPrint('Error: {}. {}, line: {}'.format(sys.exc_info()[0],
+    #                                                        sys.exc_info()[1],
+    #                                                        sys.exc_info()[2].tb_lineno))
