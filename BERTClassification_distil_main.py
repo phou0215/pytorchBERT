@@ -75,7 +75,7 @@ class PytorchDistilBERT():
         # Options and utility
         self.model = None
         self.test_rate = 0.2
-        self.batch_size = 5
+        self.batch_size = 10
         self.epoch = 10
         self.learning_rate = 1e-5
         self.device = torch.device('cpu')
@@ -536,7 +536,7 @@ class PytorchDistilBERT():
                                                       local_files_only=True)
         elif self.tokenizer_type == 'word':
             # word piece tokenizer
-            tokenizer = DistilBertTokenizer.from_pretrained(self.vocab_root_dir + "/BERT_TRAINING_VOCAB_2021-06-03 16 09 57",
+            tokenizer = DistilBertTokenizer.from_pretrained(self.vocab_root_dir + self.vocab_dir,
                                                             strip_accents=False,
                                                             lowercase=True)
         else:
@@ -592,7 +592,7 @@ class PytorchDistilBERT():
                                                                          num_labels=len(self.label_index),
                                                                          output_attentions=False,
                                                                          output_hidden_states=False,
-                                                                         local_files_only=True).to(self.device)
+                                                                         local_files_only=False).to(self.device)
 
         # dataLoader
         dataloader_train = DataLoader(dataset_train,
