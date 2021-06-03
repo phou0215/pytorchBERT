@@ -15,7 +15,6 @@ from konlpy.tag import Komoran
 from collections import Counter
 from datetime import datetime
 
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
 
@@ -26,7 +25,7 @@ from tokenizers import BertWordPieceTokenizer, SentencePieceBPETokenizer, CharBP
 from transformers import AdamW, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup, \
     get_cosine_with_hard_restarts_schedule_with_warmup
 # from torch.optim import optimizer, Adam
-from torch.nn import functional as F
+
 
 
 # data set control
