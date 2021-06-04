@@ -21,11 +21,10 @@ from sklearn.metrics import f1_score
 # from tqdm.notebook import tqdm
 from torch.utils.data import DataLoader, Dataset, TensorDataset, RandomSampler, SequentialSampler
 from transformers import BertTokenizer, BertForSequenceClassification, BertConfig, BertTokenizerFast
-from tokenizers import BertWordPieceTokenizer, SentencePieceBPETokenizer, CharBPETokenizer, ByteLevelBPETokenizer
+from tokenizers import BertWordPieceTokenizer
 from transformers import AdamW, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup, \
     get_cosine_with_hard_restarts_schedule_with_warmup
 # from torch.optim import optimizer, Adam
-
 
 
 # data set control
@@ -51,7 +50,7 @@ class PytorchBERT():
         self.df_data = None
         self.label_index = None
 
-        # type '' => base no customer tokenizer, type 'word' => word piece, type 'sentence' => sentence piece
+        # type '' => base no customer tokenizer, type 'word' => word piece
         self.tokenizer_type = 'word'
         # if tokenizer_type is not default select konlpy parse type 'okt' or default is Okt , 'komoran' is Komoran
         self.subword_type = 'okt'
@@ -134,32 +133,23 @@ class PytorchBERT():
 
     # ###################### matplot graph 지원함수 #######################
 
-    def generate_graph(self):
+    def generate_graph(self, total_train_loss, total_val_loss, total_f1):
 
         x = np.linspace(1, self.epoch, self.epoch)
-        self.figure, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 8))
-        ax1.set_title('LOSS')
-        ax1.set(xlabel='Epoch', ylabel='avg_loss')
-        self.line_loss, = ax1.plot(x, np.array([0.000] * self.epoch), 'tab:blue')
+        self.figure = plt.figure(figsize=(12, 8))
+        ax1 = self.figure.add_subplot(2, 1, 1)
+        ax2 = self.figure.add_subplot(2, 1, 2)
 
-        ax2.set_title('F1 SCORE')
-        ax2.set(xlabel='Epoch', ylabel='F1 Score')
-        self.line_score, = ax2.plot(x, np.array([0.000] * self.epoch), 'tab:green')
+        ax1.plot(x, total_train_loss, x, total_val_loss)
+        ax2.plot(x, total_f1, 'b--')
 
-    def init_graph(self):
+        ax1.set_xlabel('Epoch')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('AVG_F1 SCORE')
+        ax1.legend(['AVG_TRAIN_LOSS', 'AVG_VAL_LOSS'])
+        ax2.legend(['AVG_F1 SCORE'])
 
-        self.figure.canvas.draw()
-        # self.figure.canvas.flush_events()
-
-    def grid_loss_graph(self, y):
-        x_data = np.linspace(1, self.epoch, self.epoch)
-        self.line_loss.set_xdata(x_data)
-        self.line_loss.set_ydata(y)
-
-    def grid_f1_graph(self, y):
-        x_data = np.linspace(1, self.epoch, self.epoch)
-        self.line_score.set_xdata(x_data)
-        self.line_score.set_ydata(y)
+        plt.show()
 
     # ####################################################################
 
@@ -337,8 +327,7 @@ class PytorchBERT():
                                                    handle_chinese_chars=True,
                                                    wordpieces_prefix="##"
                                                    )
-            else:
-                tokenizer = SentencePieceBPETokenizer()
+
             # when selected 'base' going to use bert-base-uncased tokenizer... close function
 
             # training vocab start
@@ -363,20 +352,6 @@ class PytorchBERT():
 
             # save tokenizer
             tokenizer.save_model(self.vocab_root_dir + self.vocab_dir)
-
-            if self.tokenizer_type == 'sentence':
-
-                list_vocab = []
-                with open(self.vocab_root_dir + self.vocab_dir + '/merges.txt', 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-                    for line in lines:
-                        if line.strip() != '':
-                            list_vocab.append(line)
-                print('출력내용 {}'.format(list_vocab[len(list_vocab) - 1]))
-                with open(self.vocab_root_dir + self.vocab_dir + '/merges.txt', 'w', encoding='utf-8') as f:
-                    for vocab in list_vocab:
-                        f.write(vocab)
-                self.setPrint('Rewrite merges text file completed')
 
         except:
             self.setPrint('Error: {}. {}, line: {}'.format(sys.exc_info()[0],
@@ -447,8 +422,12 @@ class PytorchBERT():
                                                                    stratify=self.list_label)
             self.setPrint('Train_Data_Rate: {:.2f}%, Test_Data_Rate: {:.2f}% '.
                           format((1 - self.test_rate) * 100, self.test_rate * 100))
-            self.setPrint('Train_Data_Count: {}\nTest_Data_Count:{}\nCorpus_Data_Count:{}'.format(
-                len(self.Train_Data_Y), len(self.Test_Data_Y), len(self.list_corpus)))
+            if self.tokenizer_type != '':
+                self.setPrint('Train_Data_Count: {}\nTest_Data_Count:{}\nCorpus_Data_Count:{}'.format(
+                    len(self.Train_Data_Y), len(self.Test_Data_Y), len(self.list_corpus)))
+            else:
+                self.setPrint('Train_Data_Count: {}\nTest_Data_Count:{}'.format(
+                    len(self.Train_Data_Y), len(self.Test_Data_Y)))
         except:
             self.setPrint('Error: {}. {}, line: {}'.format(sys.exc_info()[0],
                                                            sys.exc_info()[1],
@@ -535,15 +514,11 @@ class PytorchBERT():
                                                       lowercase=True,
                                                       strip_accents=False,
                                                       local_files_only=True)
-        elif self.tokenizer_type == 'word':
+        else:
             # word piece tokenizer
             tokenizer = BertTokenizerFast.from_pretrained(self.vocab_root_dir + self.vocab_dir,
                                                           strip_accents=False,
                                                           lowercase=True)
-        else:
-            # sentence tokenizer
-            tokenizer = SentencePieceBPETokenizer(self.vocab_root_dir + self.vocab_dir + '/vocab.json',
-                                                  self.vocab_root_dir + self.vocab_dir + '/merges.txt', )
 
         self.setPrint('Load Customer Vocab size : {}'.format(tokenizer.vocab_size))
         # tokenizer Loading check
@@ -612,8 +587,9 @@ class PytorchBERT():
         #                                                                num_warmup_steps=0,
         #                                                                num_training_steps=len(dataloader_train) * self.epoch)
         # for loss f1 graph
-        total_loss = np.array([0.0000] * 5)
-        total_score = np.array([0.0000] * 5)
+        total_loss = np.array([0.0000] * self.epoch)
+        total_val_loss = np.array([0.0000] * self.epoch)
+        total_score = np.array([0.0000] * self.epoch)
 
         # Training start
         for epoch in range(1, self.epoch + 1):
@@ -655,17 +631,19 @@ class PytorchBERT():
 
             val_loss, predictions, true_vals = self.evaluate(dataloader_test)
             val_f1 = self.f1_score_func(predictions, true_vals)
+
             total_score[epoch - 1] = round(val_f1, 4)
+            total_val_loss[epoch - 1] = round(val_loss, 4)
 
             self.setPrint('[{}] Validation loss: {:.4f}'.format(epoch, val_loss))
             self.setPrint('[{}] F1 Score : {:.4f}'.format(epoch, val_f1))
 
         # generate graph
-        plt.ion()
-        self.generate_graph()
-        self.grid_loss_graph(total_loss)
-        self.grid_f1_graph(total_score)
-        self.init_graph()
+        self.generate_graph(total_train_loss, total_val_loss, total_score)
+        # plt.ion()
+        # self.grid_loss_graph(total_loss)
+        # self.grid_f1_graph(total_score)
+        # self.init_graph()
 
     # ##############################################################
 
@@ -707,3 +685,52 @@ if __name__ == "__main__":
     #         self.setPrint('Error: {}. {}, line: {}'.format(sys.exc_info()[0],
     #                                                        sys.exc_info()[1],
     #                                                        sys.exc_info()[2].tb_lineno))
+
+    # def generate_graph(self):
+    #     x = np.linspace(1, self.epoch, self.epoch)
+    #     self.figure, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 8))
+    #     ax1.set_title('LOSS')
+    #     ax1.set(xlabel='Epoch', ylabel='avg_loss')
+    #     self.line_loss, = ax1.plot(x, np.array([0.000] * self.epoch), 'tab:blue')
+    #
+    #     ax2.set_title('F1 SCORE')
+    #     ax2.set(xlabel='Epoch', ylabel='F1 Score')
+    #     self.line_score, = ax2.plot(x, np.array([0.000] * self.epoch), 'tab:green')
+    #
+    #
+    # def init_graph(self):
+    #     self.figure.canvas.draw()
+    #     # self.figure.canvas.flush_events()
+    #
+    #
+    # def grid_loss_graph(self, y):
+    #     x_data = np.linspace(1, self.epoch, self.epoch)
+    #     self.line_loss.set_xdata(x_data)
+    #     self.line_loss.set_ydata(y)
+    #
+    #
+    # def grid_f1_graph(self, y):
+    #     x_data = np.linspace(1, self.epoch, self.epoch)
+    #     self.line_score.set_xdata(x_data)
+    #     self.line_score.set_ydata(y)
+
+
+
+    # if self.tokenizer_type == 'sentence':
+    #
+    #     list_vocab = []
+    #     with open(self.vocab_root_dir + self.vocab_dir + '/merges.txt', 'r', encoding='utf-8') as f:
+    #         lines = f.readlines()
+    #         for line in lines:
+    #             if line.strip() != '':
+    #                 list_vocab.append(line)
+    #     print('출력내용 {}'.format(list_vocab[len(list_vocab) - 1]))
+    #     with open(self.vocab_root_dir + self.vocab_dir + '/merges.txt', 'w', encoding='utf-8') as f:
+    #         for vocab in list_vocab:
+    #             f.write(vocab)
+    #     self.setPrint('Rewrite merges text file completed')
+
+    # else:
+    # # sentence tokenizer
+    # tokenizer = SentencePieceBPETokenizer(self.vocab_root_dir + self.vocab_dir + '/vocab.json',
+    #                                       self.vocab_root_dir + self.vocab_dir + '/merges.txt', )
